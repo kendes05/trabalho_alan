@@ -13,6 +13,9 @@ from main import (
     gerar_plano_execucao,
     exibir_plano_execucao,
     construir_grafo,
+    otimizar_consulta,
+    construir_grafo_otimizado,
+    exibir_otimizacao,
 )
 
 # ─────────────────────────────────────────────
@@ -92,9 +95,11 @@ class App(tk.Tk):
         self.configure(bg=COR_BG)
         self.geometry("1100x780")
         self.minsize(900, 650)
-        self._parsed   = None
-        self._img_path = None
-        self._photo    = None
+        self._parsed    = None
+        self._img_path  = None
+        self._photo     = None
+        self._img_path_opt = None
+        self._photo_opt    = None
         self._construir_ui()
 
     def _construir_ui(self):
@@ -109,7 +114,7 @@ class App(tk.Tk):
         ).pack(side="left")
 
         tk.Label(
-            topo, text="HU1 · HU2 · HU3 · HU5",
+            topo, text="HU1 · HU2 · HU3 · HU4 · HU5",
             bg=COR_BG, fg=COR_PLACEHOLDER,
             font=("Segoe UI", 10)
         ).pack(side="left", padx=12, pady=4)
@@ -188,10 +193,15 @@ class App(tk.Tk):
         nb.add(tab3, text="  HU3 · Grafo de Operadores  ")
         self._montar_tab_grafo(tab3)
 
-        # Tab 4 — HU5 plano
+        # Tab 4 — HU4 otimização
         tab4 = tk.Frame(nb, bg=COR_PAINEL)
-        nb.add(tab4, text="  HU5 · Plano de Execução  ")
-        self.txt_hu5 = criar_texto_readonly(tab4, height=10)
+        nb.add(tab4, text="  HU4 · Otimização  ")
+        self._montar_tab_grafo_otimizado(tab4)
+
+        # Tab 5 — HU5 plano
+        tab5 = tk.Frame(nb, bg=COR_PAINEL)
+        nb.add(tab5, text="  HU5 · Plano de Execução  ")
+        self.txt_hu5 = criar_texto_readonly(tab5, height=10)
         self.txt_hu5.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.nb = nb
@@ -222,6 +232,37 @@ class App(tk.Tk):
         sb_v.pack(side="right",  fill="y")
         sb_h.pack(side="bottom", fill="x")
         self.canvas_grafo.pack(fill="both", expand=True)
+
+    def _montar_tab_grafo_otimizado(self, pai):
+        """Aba HU4 — texto de otimizações + grafo otimizado."""
+        # Texto de heurísticas aplicadas
+        self.txt_hu4 = criar_texto_readonly(pai, height=8)
+        self.txt_hu4.pack(fill="x", padx=10, pady=(10, 4))
+
+        frame_topo = tk.Frame(pai, bg=COR_PAINEL)
+        frame_topo.pack(fill="x", padx=10, pady=(0, 4))
+
+        self.lbl_grafo_opt_status = tk.Label(
+            frame_topo, text="Execute uma consulta para gerar o grafo otimizado.",
+            bg=COR_PAINEL, fg=COR_PLACEHOLDER, font=FONTE_LABEL
+        )
+        self.lbl_grafo_opt_status.pack(side="left")
+
+        btn_salvar_opt = tk.Button(frame_topo, text="💾  Salvar imagem", command=self._salvar_grafo_otimizado)
+        btn_style(btn_salvar_opt)
+        btn_salvar_opt.pack(side="right")
+
+        frame_canvas = tk.Frame(pai, bg=COR_PAINEL)
+        frame_canvas.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        self.canvas_grafo_opt = tk.Canvas(frame_canvas, bg=COR_PAINEL, bd=0, highlightthickness=0)
+        sb_v = ttk.Scrollbar(frame_canvas, orient="vertical",   command=self.canvas_grafo_opt.yview)
+        sb_h = ttk.Scrollbar(frame_canvas, orient="horizontal", command=self.canvas_grafo_opt.xview)
+        self.canvas_grafo_opt.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
+
+        sb_v.pack(side="right",  fill="y")
+        sb_h.pack(side="bottom", fill="x")
+        self.canvas_grafo_opt.pack(fill="both", expand=True)
 
     # ─────────────────────────────────────────
     # AÇÕES
@@ -263,12 +304,19 @@ class App(tk.Tk):
             caminho_img = construir_grafo(parsed, nome_arquivo=tmp)
             self._img_path = caminho_img
 
+            # HU4
+            opt = otimizar_consulta(parsed)
+            tmp_opt = tempfile.mktemp()
+            caminho_img_opt = construir_grafo_otimizado(opt, nome_arquivo=tmp_opt)
+            self._img_path_opt = caminho_img_opt
+            txt_hu4 = exibir_otimizacao(opt)
+
             # HU5
-            plano    = gerar_plano_execucao(parsed)
+            plano    = gerar_plano_execucao(parsed, otimizado=opt)
             txt_hu5  = exibir_plano_execucao(plano)
 
             self.after(0, lambda: self._mostrar_resultados(
-                "\n".join(linhas_hu1), txt_hu2, caminho_img, txt_hu5, ok=True
+                "\n".join(linhas_hu1), txt_hu2, caminho_img, txt_hu4, caminho_img_opt, txt_hu5, ok=True
             ))
 
         except ErroSQL as e:
@@ -276,20 +324,25 @@ class App(tk.Tk):
         except Exception as e:
             self.after(0, lambda: self._mostrar_erro(f"Erro inesperado: {e}"))
 
-    def _mostrar_resultados(self, hu1, hu2, img_path, hu5, ok):
+    def _mostrar_resultados(self, hu1, hu2, img_path, hu4, img_path_opt, hu5, ok):
         escrever_texto(self.txt_hu1, hu1, cor=COR_OK)
         escrever_texto(self.txt_hu2, hu2)
+        escrever_texto(self.txt_hu4, hu4)
         escrever_texto(self.txt_hu5, hu5)
         self._carregar_imagem_grafo(img_path)
+        self._carregar_imagem_grafo_otimizado(img_path_opt)
         self._set_status("✔ Consulta válida", COR_OK)
         self.btn_exec.config(state="normal")
 
     def _mostrar_erro(self, msg):
         escrever_texto(self.txt_hu1, f"✘ Erro de validação:\n\n  {msg}", cor=COR_ERRO)
         escrever_texto(self.txt_hu2, "")
+        escrever_texto(self.txt_hu4, "")
         escrever_texto(self.txt_hu5, "")
         self.canvas_grafo.delete("all")
+        self.canvas_grafo_opt.delete("all")
         self.lbl_grafo_status.config(text="Nenhum grafo — consulta inválida.", fg=COR_ERRO)
+        self.lbl_grafo_opt_status.config(text="Nenhum grafo — consulta inválida.", fg=COR_ERRO)
         self._set_status("✘ Erro na consulta", COR_ERRO)
         self.btn_exec.config(state="normal")
         self.nb.select(0)
@@ -313,19 +366,45 @@ class App(tk.Tk):
         except Exception as e:
             self.lbl_grafo_status.config(text=f"Erro ao carregar imagem: {e}", fg=COR_ERRO)
 
+    def _carregar_imagem_grafo_otimizado(self, path):
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            self._photo_opt = ImageTk.PhotoImage(img)
+            self.canvas_grafo_opt.delete("all")
+            self.canvas_grafo_opt.create_image(0, 0, anchor="nw", image=self._photo_opt)
+            self.canvas_grafo_opt.configure(scrollregion=(0, 0, img.width, img.height))
+            self.lbl_grafo_opt_status.config(
+                text=f"Grafo otimizado gerado ({img.width}×{img.height}px)", fg=COR_OK
+            )
+        except ImportError:
+            self.lbl_grafo_opt_status.config(
+                text=f"Instale Pillow para visualizar aqui.\nArquivo salvo em: {path}",
+                fg=COR_AMARELO,
+            )
+        except Exception as e:
+            self.lbl_grafo_opt_status.config(text=f"Erro ao carregar imagem: {e}", fg=COR_ERRO)
+
     def _limpar(self):
         self.txt_entrada.delete("1.0", "end")
         escrever_texto(self.txt_hu1, "")
         escrever_texto(self.txt_hu2, "")
+        escrever_texto(self.txt_hu4, "")
         escrever_texto(self.txt_hu5, "")
         self.canvas_grafo.delete("all")
+        self.canvas_grafo_opt.delete("all")
         self.lbl_grafo_status.config(
             text="Execute uma consulta para gerar o grafo.", fg=COR_PLACEHOLDER
         )
+        self.lbl_grafo_opt_status.config(
+            text="Execute uma consulta para gerar o grafo otimizado.", fg=COR_PLACEHOLDER
+        )
         self._set_status("", None)
-        self._parsed   = None
-        self._img_path = None
-        self._photo    = None
+        self._parsed       = None
+        self._img_path     = None
+        self._photo        = None
+        self._img_path_opt = None
+        self._photo_opt    = None
         self.var_exemplo.set("Exemplos")
 
     def _carregar_exemplo(self, escolha):
@@ -347,6 +426,20 @@ class App(tk.Tk):
             import shutil
             shutil.copy(self._img_path, destino)
             messagebox.showinfo("Salvo", f"Grafo salvo em:\n{destino}")
+
+    def _salvar_grafo_otimizado(self):
+        if not self._img_path_opt or not os.path.exists(self._img_path_opt):
+            messagebox.showwarning("Aviso", "Nenhum grafo otimizado disponível para salvar.")
+            return
+        destino = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("Todos", "*.*")],
+            initialfile="grafo_otimizado.png",
+        )
+        if destino:
+            import shutil
+            shutil.copy(self._img_path_opt, destino)
+            messagebox.showinfo("Salvo", f"Grafo otimizado salvo em:\n{destino}")
 
     def _set_status(self, msg, cor):
         self.lbl_status.config(text=msg, fg=cor or COR_TEXTO)

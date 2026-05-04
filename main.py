@@ -300,38 +300,411 @@ def construir_grafo(parsed, nome_arquivo="grafo_operadores"):
 
 
 # ─────────────────────────────────────────────
+# HU4 — OTIMIZAÇÃO DA CONSULTA (HEURÍSTICAS)
+# ─────────────────────────────────────────────
+
+def _extrair_tabelas_cond(cond, alias_map):
+    """Retorna o conjunto de tabelas referenciadas em uma condição."""
+    tabelas = set()
+    for token in re.findall(r'[\w.]+', cond):
+        if '.' in token:
+            prefixo = token.split('.')[0]
+            tabela = alias_map.get(prefixo, prefixo)
+            if tabela in SCHEMA:
+                tabelas.add(tabela)
+        else:
+            t = token.lower()
+            if t in SCHEMA:
+                tabelas.add(t)
+    return tabelas
+
+
+def _contar_atributos_where(where_clause):
+    """Conta quantas condições AND existem (proxy de restritividade)."""
+    if not where_clause:
+        return 0
+    return len(re.split(r'\band\b', where_clause))
+
+
+def otimizar_consulta(parsed):
+    """
+    Aplica heurísticas de otimização e devolve uma representação otimizada.
+
+    Heurísticas aplicadas:
+      a-i)  Seleção (WHERE) pushed-down — aplicada à tabela antes dos JOINs
+      a-ii) Projeção intermediária — restringe atributos o mais cedo possível
+      b-i)  Reordenação de JOINs — joins mais restritivos (com condição que
+            envolve mais atributos / linker direto com tabela base) ficam primeiro
+      b-ii) Garante que nenhum produto cartesiano seja introduzido (todos os
+            JOINs têm condição ON verificada no parser)
+    """
+    import copy
+    opt = copy.deepcopy(parsed)
+
+    colunas   = opt["colunas"]
+    tabela_p  = opt["tabela_principal"]
+    alias_p   = opt["alias_principal"]
+    joins     = opt["joins"]
+    where     = opt["where"]
+    alias_map = opt["alias_map"]
+
+    # ── Heurística b-i: reordenar JOINs por restritividade ──────────────
+    # Critério: joins cuja condição ON referencia a tabela principal diretamente
+    # vêm primeiro; depois os demais na ordem original (preserva encadeamento).
+    def _score_join(j):
+        tabelas_na_cond = _extrair_tabelas_cond(j["condicao"], alias_map)
+        # Quanto mais a condição liga diretamente à tabela principal, menor o score (vem antes)
+        direto = 1 if tabela_p in tabelas_na_cond else 2
+        # Restritividade pela quantidade de termos na condição ON (mais termos = mais restritivo)
+        termos = len(re.findall(r'[\w.]+', j["condicao"]))
+        return (direto, -termos)
+
+    opt["joins"] = sorted(joins, key=_score_join)
+
+    # ── Heurística a-i: identificar quais partes do WHERE podem ser pushed-down ──
+    # Divide o WHERE em sub-condições AND e classifica cada uma pela tabela que afeta.
+    pushed_down = {}   # alias_tabela -> lista de sub-condições
+    remaining_where = []
+
+    if where:
+        sub_conds = [s.strip() for s in re.split(r'\band\b', where) if s.strip()]
+        for sub in sub_conds:
+            # Verifica se a condição só usa colunas de uma única tabela
+            tabelas_ref = set()
+            for token in re.findall(r'[\w.]+', sub):
+                if re.fullmatch(r'-?\d+(\.\d+)?', token):
+                    continue  # literal numérico
+                if '.' in token:
+                    prefixo = token.split('.')[0].lower()
+                    if prefixo in alias_map:
+                        tabelas_ref.add(alias_map[prefixo])
+                else:
+                    # token sem prefixo: busca em qual tabela esse campo existe
+                    t = token.lower()
+                    for alias, tabela in alias_map.items():
+                        if tabela in SCHEMA and t in SCHEMA[tabela]:
+                            tabelas_ref.add(tabela)
+            if len(tabelas_ref) == 1:
+                tbl = list(tabelas_ref)[0]
+                pushed_down.setdefault(tbl, []).append(sub)
+            else:
+                remaining_where.append(sub)
+
+    opt["pushed_down_filters"] = pushed_down        # seleções antecipadas por tabela
+    opt["remaining_where"]     = remaining_where    # seleções que ficam após JOIN
+
+    # ── Heurística a-ii: projeções intermediárias ────────────────────────
+    # Para cada tabela envolvida, calcula quais colunas realmente são necessárias
+    # (aparecem no SELECT, nos JOINs ou no WHERE) — permite push-down de projeção.
+    colunas_necessarias = {}   # tabela -> set de campos
+
+    def _registrar(col_token):
+        r = resolver_coluna(col_token, alias_map)
+        if r and r[0] != "ambíguo":
+            tbl, campo = r
+            colunas_necessarias.setdefault(tbl, set()).add(campo)
+
+    # Colunas do SELECT
+    if colunas != ["*"]:
+        for c in colunas:
+            _registrar(c)
+
+    # Colunas dos JOINs
+    for j in opt["joins"]:
+        for token in re.findall(r'[\w.]+', j["condicao"]):
+            if '.' in token or token.lower() not in ('and', 'or', 'on'):
+                _registrar(token)
+
+    # Colunas do WHERE
+    if where:
+        for token in re.findall(r'[\w.]+', where):
+            if '.' in token:
+                _registrar(token)
+
+    opt["proj_intermediaria"] = colunas_necessarias
+
+    # ── Álgebra relacional otimizada (texto) ─────────────────────────────
+    opt["algebra_otimizada"]  = _gerar_algebra_otimizada(opt)
+
+    # ── Passos de otimização para exibição ───────────────────────────────
+    opt["passos_otimizacao"]  = _descrever_otimizacoes(opt, joins, where)
+
+    return opt
+
+
+def _gerar_algebra_otimizada(opt):
+    """Gera a expressão de álgebra relacional após aplicar as heurísticas."""
+    tabela_p  = opt["tabela_principal"]
+    alias_p   = opt["alias_principal"]
+    joins     = opt["joins"]
+    colunas   = opt["colunas"]
+    pushed    = opt.get("pushed_down_filters", {})
+    remaining = opt.get("remaining_where", [])
+    proj_int  = opt.get("proj_intermediaria", {})
+
+    def _nome(tabela, alias):
+        return f"{tabela} ρ({alias})" if alias != tabela else tabela
+
+    def _proj_int_expr(expr, tabela):
+        """Aplica projeção intermediária se não for SELECT *."""
+        if colunas == ["*"]:
+            return expr
+        cols = proj_int.get(tabela, set())
+        if cols:
+            return f"π[{', '.join(sorted(cols))}]({expr})"
+        return expr
+
+    # Tabela base com seleção pushed-down e projeção intermediária
+    base_expr = _nome(tabela_p, alias_p)
+    if tabela_p in pushed:
+        filtro = " AND ".join(pushed[tabela_p])
+        base_expr = f"σ[{filtro}]({base_expr})"
+    base_expr = _proj_int_expr(base_expr, tabela_p)
+
+    for j in joins:
+        lado_dir = _nome(j["tabela"], j["alias"])
+        if j["tabela"] in pushed:
+            filtro = " AND ".join(pushed[j["tabela"]])
+            lado_dir = f"σ[{filtro}]({lado_dir})"
+        lado_dir = _proj_int_expr(lado_dir, j["tabela"])
+
+        base_expr = f"({base_expr} ⋈ [{j['condicao']}] {lado_dir})"
+
+    # Seleções restantes (condições entre tabelas)
+    if remaining:
+        base_expr = f"σ[{' AND '.join(remaining)}]({base_expr})"
+
+    # Projeção final
+    if colunas != ["*"]:
+        base_expr = f"π[{', '.join(colunas)}]({base_expr})"
+
+    return base_expr
+
+
+def _descrever_otimizacoes(opt, joins_originais, where_original):
+    """Retorna lista de strings descrevendo cada heurística aplicada."""
+    descricoes = []
+
+    # Reordenação de JOINs
+    nomes_orig = [j["tabela"] for j in joins_originais]
+    nomes_opt  = [j["tabela"] for j in opt["joins"]]
+    if nomes_orig != nomes_opt:
+        descricoes.append(
+            f"[b-i] JOINs reordenados por restritividade:\n"
+            f"       Antes : {' → '.join(nomes_orig)}\n"
+            f"       Depois: {' → '.join(nomes_opt)}"
+        )
+    else:
+        descricoes.append("[b-i] Ordem dos JOINs mantida (já otimizada).")
+
+    # Push-down de seleção
+    pushed = opt.get("pushed_down_filters", {})
+    if pushed:
+        for tbl, conds in pushed.items():
+            descricoes.append(
+                f"[a-i] Seleção antecipada (push-down) em '{tbl}':\n"
+                f"       σ[{' AND '.join(conds)}] aplicada antes do JOIN"
+            )
+    else:
+        descricoes.append("[a-i] Nenhuma seleção pode ser antecipada (WHERE cruza tabelas).")
+
+    # Seleções que ficaram após JOIN
+    remaining = opt.get("remaining_where", [])
+    if remaining:
+        descricoes.append(
+            f"[a-i] Seleção pós-JOIN mantida:\n"
+            f"       σ[{' AND '.join(remaining)}]"
+        )
+
+    # Projeções intermediárias
+    proj = opt.get("proj_intermediaria", {})
+    if proj and opt["colunas"] != ["*"]:
+        for tbl, cols in proj.items():
+            descricoes.append(
+                f"[a-ii] Projeção intermediária em '{tbl}':\n"
+                f"        π[{', '.join(sorted(cols))}]"
+            )
+    else:
+        descricoes.append("[a-ii] SELECT * — projeção intermediária não aplicável.")
+
+    # Produto cartesiano
+    descricoes.append("[b-ii] Nenhum produto cartesiano — todos os JOINs possuem cláusula ON.")
+
+    return descricoes
+
+
+def construir_grafo_otimizado(opt, nome_arquivo="grafo_otimizado"):
+    """
+    Constrói o grafo de operadores OTIMIZADO, incorporando:
+      - push-down de seleção (σ antes do JOIN)
+      - projeção intermediária (π por tabela)
+      - ordem de JOINs reordenada
+    """
+    dot = Digraph(name="grafo_otimizado", graph_attr={"rankdir": "TB", "fontname": "Helvetica"})
+    dot.attr("node", fontname="Helvetica", fontsize="11")
+
+    colunas   = opt["colunas"]
+    tabela_p  = opt["tabela_principal"]
+    alias_p   = opt["alias_principal"]
+    joins     = opt["joins"]
+    pushed    = opt.get("pushed_down_filters", {})
+    remaining = opt.get("remaining_where", [])
+    proj_int  = opt.get("proj_intermediaria", {})
+
+    contador = [0]
+
+    def novo_id(prefixo="n"):
+        contador[0] += 1
+        return f"{prefixo}_{contador[0]}"
+
+    def _folha_com_otimizacoes(tabela, alias):
+        """Cria nó folha + push-down de σ e π intermediária. Retorna id do topo."""
+        id_folha = novo_id("folha")
+        label = tabela if alias == tabela else f"{tabela}\n(alias: {alias})"
+        dot.node(id_folha, label, shape="rectangle", style="filled", fillcolor="#cce5ff")
+        topo = id_folha
+
+        # Push-down de seleção (Heurística a-i)
+        if tabela in pushed:
+            id_sel = novo_id("sel")
+            filtro = " AND ".join(pushed[tabela])
+            dot.node(id_sel, f"σ [push-down]\n{filtro}",
+                     shape="ellipse", style="filled", fillcolor="#d4edda")
+            dot.edge(id_sel, topo)
+            topo = id_sel
+
+        # Projeção intermediária (Heurística a-ii)
+        if colunas != ["*"] and tabela in proj_int:
+            cols = sorted(proj_int[tabela])
+            id_pi = novo_id("pi")
+            dot.node(id_pi, f"π [interm.]\n{', '.join(cols)}",
+                     shape="ellipse", style="filled", fillcolor="#e2d9f3")
+            dot.edge(id_pi, topo)
+            topo = id_pi
+
+        return topo
+
+    # Folha principal
+    no_atual = _folha_com_otimizacoes(tabela_p, alias_p)
+
+    # JOINs (em ordem otimizada — Heurística b-i)
+    for j in joins:
+        no_join_dir = _folha_com_otimizacoes(j["tabela"], j["alias"])
+        id_join = novo_id("join")
+        dot.node(id_join, f"⋈\n{j['condicao']}",
+                 shape="diamond", style="filled", fillcolor="#fff3cd")
+        dot.edge(id_join, no_atual)
+        dot.edge(id_join, no_join_dir)
+        no_atual = id_join
+
+    # Seleções restantes pós-JOIN
+    if remaining:
+        id_sel_rem = novo_id("sel")
+        dot.node(id_sel_rem, f"σ [pós-JOIN]\n{' AND '.join(remaining)}",
+                 shape="ellipse", style="filled", fillcolor="#d4edda")
+        dot.edge(id_sel_rem, no_atual)
+        no_atual = id_sel_rem
+
+    # Projeção final (raiz)
+    id_proj = novo_id("proj")
+    label_proj = "π [final]\n" + (", ".join(colunas) if colunas != ["*"] else "*")
+    dot.node(id_proj, label_proj, shape="ellipse", style="filled", fillcolor="#f8d7da")
+    dot.edge(id_proj, no_atual)
+
+    caminho = dot.render(nome_arquivo, format="png", cleanup=True)
+    return caminho
+
+
+def exibir_otimizacao(opt):
+    """Formata o relatório de otimização para exibição na interface."""
+    linhas = []
+    linhas.append("── Álgebra Relacional Otimizada ──")
+    linhas.append(f"  {opt['algebra_otimizada']}")
+    linhas.append("")
+    linhas.append("── Heurísticas Aplicadas ──")
+    for desc in opt["passos_otimizacao"]:
+        for linha in desc.splitlines():
+            linhas.append(f"  {linha}")
+        linhas.append("")
+    return "\n".join(linhas)
+
+
+# ─────────────────────────────────────────────
 # HU5 — PLANO DE EXECUÇÃO
 # ─────────────────────────────────────────────
 
-def gerar_plano_execucao(parsed):
-    colunas  = parsed["colunas"]
-    tabela_p = parsed["tabela_principal"]
-    alias_p  = parsed["alias_principal"]
-    joins    = parsed["joins"]
-    where    = parsed["where"]
+def gerar_plano_execucao(parsed, otimizado=None):
+    """
+    Gera o plano de execução.
+    Se 'otimizado' for fornecido, usa a ordem otimizada de JOINs e push-downs.
+    """
+    fonte    = otimizado if otimizado else parsed
+    colunas  = fonte["colunas"]
+    tabela_p = fonte["tabela_principal"]
+    alias_p  = fonte["alias_principal"]
+    joins    = fonte["joins"]
+    where    = fonte.get("where")
+    pushed   = fonte.get("pushed_down_filters", {})
+    remaining= fonte.get("remaining_where", [])
+    proj_int = fonte.get("proj_intermediaria", {})
+    is_opt   = otimizado is not None
 
     passos = []
     passo  = 1
 
+    # SCAN + push-downs da tabela principal
     passos.append((passo, "SCAN", f"Leitura da tabela '{tabela_p}'" +
                    (f" (alias: {alias_p})" if alias_p != tabela_p else "")))
     passo += 1
 
+    if is_opt and tabela_p in pushed:
+        passos.append((passo, "SELECT",
+                       f"[push-down] σ[{' AND '.join(pushed[tabela_p])}] em '{tabela_p}'"))
+        passo += 1
+
+    if is_opt and colunas != ["*"] and tabela_p in proj_int:
+        cols = sorted(proj_int[tabela_p])
+        passos.append((passo, "PROJECT",
+                       f"[interm.] π[{', '.join(cols)}] em '{tabela_p}'"))
+        passo += 1
+
+    # SCAN + push-downs de cada tabela de JOIN
     for j in joins:
         passos.append((passo, "SCAN", f"Leitura da tabela '{j['tabela']}'" +
                        (f" (alias: {j['alias']})" if j['alias'] != j['tabela'] else "")))
         passo += 1
 
-    if where:
+        if is_opt and j["tabela"] in pushed:
+            passos.append((passo, "SELECT",
+                           f"[push-down] σ[{' AND '.join(pushed[j['tabela']])}] em '{j['tabela']}'"))
+            passo += 1
+
+        if is_opt and colunas != ["*"] and j["tabela"] in proj_int:
+            cols = sorted(proj_int[j["tabela"]])
+            passos.append((passo, "PROJECT",
+                           f"[interm.] π[{', '.join(cols)}] em '{j['tabela']}'"))
+            passo += 1
+
+    # Seleção WHERE (sem otimização)
+    if not is_opt and where:
         passos.append((passo, "SELECT", f"Aplicar seleção σ[{where}]"))
         passo += 1
 
+    # JOINs
     tabela_atual = tabela_p
     for j in joins:
-        passos.append((passo, "JOIN", f"Junção ⋈  {tabela_atual}  ×  {j['tabela']}  ON  {j['condicao']}"))
+        passos.append((passo, "JOIN",
+                       f"Junção ⋈  {tabela_atual}  ×  {j['tabela']}  ON  {j['condicao']}"))
         tabela_atual = f"({tabela_atual} ⋈ {j['tabela']})"
         passo += 1
 
+    # Seleções pós-JOIN (otimizado)
+    if is_opt and remaining:
+        passos.append((passo, "SELECT",
+                       f"[pós-JOIN] σ[{' AND '.join(remaining)}]"))
+        passo += 1
+
+    # Projeção final
     if colunas != ["*"]:
         passos.append((passo, "PROJECT", f"Projeção π[{', '.join(colunas)}]"))
         passo += 1
@@ -354,7 +727,7 @@ SEPARADOR = "─" * 60
 def cabecalho():
     print(SEPARADOR)
     print("  Processador de Consultas SQL")
-    print("  HU1 – Validação  |  HU2 – Álgebra Relacional  |  HU3 – Grafo  |  HU5 – Plano de Execução")
+    print("  HU1 – Validação  |  HU2 – Álgebra Relacional  |  HU3 – Grafo  |  HU4 – Otimização  |  HU5 – Plano de Execução")
     print(SEPARADOR)
     print("  Tabelas disponíveis:", ", ".join(sorted(SCHEMA.keys())))
     print(SEPARADOR)
@@ -399,12 +772,19 @@ def loop_principal():
             print()
             print(gerar_algebra_relacional_detalhada(parsed))
             print()
-            plano = gerar_plano_execucao(parsed)
+
+            opt = otimizar_consulta(parsed)
+            print("── Otimização (HU4) ──")
+            print(exibir_otimizacao(opt))
+
+            plano = gerar_plano_execucao(parsed, otimizado=opt)
             print(exibir_plano_execucao(plano))
             print()
-            caminho = construir_grafo(parsed)
+            caminho     = construir_grafo(parsed)
+            caminho_opt = construir_grafo_otimizado(opt)
             print(f"── Grafo de Operadores ──")
-            print(f"  Imagem salva em: {caminho}")
+            print(f"  Imagem original  salva em: {caminho}")
+            print(f"  Imagem otimizada salva em: {caminho_opt}")
 
         except ErroSQL as e:
             print(f"✘ Erro de validação: {e}")
@@ -456,12 +836,16 @@ def modo_demo():
         try:
             parsed  = parse_sql(sql)
             algebra = gerar_algebra_relacional(parsed)
-            plano   = gerar_plano_execucao(parsed)
-            caminho = construir_grafo(parsed, nome_arquivo=f"grafo_{i}")
+            opt     = otimizar_consulta(parsed)
+            plano   = gerar_plano_execucao(parsed, otimizado=opt)
+            caminho     = construir_grafo(parsed, nome_arquivo=f"grafo_{i}")
+            caminho_opt = construir_grafo_otimizado(opt, nome_arquivo=f"grafo_opt_{i}")
             print("✔ Válida")
             print(f"  Álgebra: {algebra}")
+            print(f"  Álgebra otimizada: {opt['algebra_otimizada']}")
             print(exibir_plano_execucao(plano))
-            print(f"  Grafo salvo em: {caminho}")
+            print(f"  Grafo original  salvo em: {caminho}")
+            print(f"  Grafo otimizado salvo em: {caminho_opt}")
         except ErroSQL as e:
             print(f"✘ {e}")
         print(SEPARADOR)
